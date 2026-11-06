@@ -142,6 +142,147 @@ using Mapa = std::map<Arista,int>;
 
 void subdivide(SubDivMesh &mesh) {
 	
+	int n_orig = mesh.n.size();
+	int e_orig = mesh.e.size();
+	
+	// =========================================================================
+	// PASO 1: Por cada elemento original, agregar su centroide
+	// Los nuevos nodos quedan en los índices: n_orig a n_orig + e_orig - 1
+	// =========================================================================
+	for (int ie = 0; ie < e_orig; ++ie) {
+		const Elemento &ei = mesh.e[ie];
+		glm::vec3 centroide(0.0f);
+		for (int j = 0; j < ei.nv; ++j) {
+			centroide += mesh.n[ei[j]].p;
+		}
+		centroide /= static_cast<float>(ei.nv);
+		mesh.n.push_back(Nodo(centroide));
+	}
+	
+	// =========================================================================
+	// PASO 2: Por cada arista de cada cara, agregar un punto en el medio
+	// =========================================================================
+	Mapa mapa;
+	for (int ie = 0; ie < e_orig; ++ie) {
+		Elemento &ei = mesh.e[ie];
+		for (int j = 0; j < ei.nv; ++j) {
+			Arista arista(ei, j); // Arista entre ei[j] y ei[j+1]
+			
+			// Evitar procesar dos veces la misma arista interior
+			if (mapa.find(arista) != mapa.end()) continue;
+			
+			glm::vec3 p0 = mesh.n[arista.n[0]].p;
+			glm::vec3 p1 = mesh.n[arista.n[1]].p;
+			glm::vec3 pto_arista;
+			
+			int iev = ei.v[j]; // Índice del elemento vecino en la j-ésima arista
+			if (iev == -1) {
+				// Es arista de frontera: promedio de los 2 vértices de la arista
+				pto_arista = (p0 + p1) / 2.0f;
+			} else {
+				// Es arista interior: promedio de los 2 vértices y los 2 centroides
+				glm::vec3 c1 = mesh.n[n_orig + ie].p;
+				glm::vec3 c2 = mesh.n[n_orig + iev].p;
+				pto_arista = (p0 + p1 + c1 + c2) / 4.0f;
+			}
+			
+			int nuevo_idx = mesh.n.size();
+			mesh.n.push_back(Nodo(pto_arista));
+			mapa[arista] = nuevo_idx;
+		}
+	}
+	
+	// =========================================================================
+	// PASO 3: Armar los elementos nuevos (todos serán cuadriláteros)
+	// Criterio de orden: [0] = centroide, [1] = arista_ant, [2] = nodo_orig, [3] = arista_sig
+	// =========================================================================
+	for (int ie = 0; ie < e_orig; ++ie) {
+		Elemento ei = mesh.e[ie]; // Copia local porque vamos a reemplazar mesh.e[ie]
+		int idx_centroide = n_orig + ie;
+		
+		for (int j = 0; j < ei.nv; ++j) {
+			int idx_arista_ant = mapa[Arista(ei[j - 1], ei[j])];
+			int idx_nodo_orig  = ei[j];
+			int idx_arista_sig = mapa[Arista(ei[j], ei[j + 1])];
+			
+			if (j == 0) {
+				mesh.reemplazarElemento(ie, idx_centroide, idx_arista_ant, idx_nodo_orig, idx_arista_sig);
+			} else {
+				mesh.agregarElemento(idx_centroide, idx_arista_ant, idx_nodo_orig, idx_arista_sig);
+			}
+		}
+	}
+	
+	// Recalcular vecinos y actualizar el atributo es_frontera en la nueva topología
+	mesh.makeVecinos();
+	
+	// =========================================================================
+	// PASO 4: Calcular las nuevas posiciones de los nodos originales (0 a n_orig - 1)
+	// En cada elemento nuevo del nodo:
+	//   elem[0] -> centroide de la cara original (nodo de cara)
+	//   elem[1] -> punto medio de arista anterior (arista entre elem[1] y elem[2], vecino v[1])
+	//   elem[2] -> el propio nodo original (i)
+	//   elem[3] -> punto medio de arista siguiente (arista entre elem[2] y elem[3], vecino v[2])
+	// =========================================================================
+	for (int i = 0; i < n_orig; ++i) {
+		Nodo &ni = mesh.n[i];
+		if (ni.e.empty()) continue; // Por si hay algún nodo suelto
+		
+		glm::vec3 p = ni.p;
+		
+		if (!ni.es_frontera) {
+			// Nodo interior: (4r - f + (n - 3)p) / n
+			float cant_elem = static_cast<float>(ni.e.size());
+			glm::vec3 f(0.0f);
+			glm::vec3 r(0.0f);
+			
+			for (int ie : ni.e) {
+				const Elemento &elem = mesh.e[ie];
+				f += mesh.n[elem[0]].p; // Suma el centroide
+				// Promedio de los dos puntos de arista de este elemento (como cada arista 
+				// se comparte entre 2 elementos del ciclo, sumar (elem[1]+elem[3])/2 
+				// en todos los elementos equivale exactamente a sumar una vez cada arista)
+				r += (mesh.n[elem[1]].p + mesh.n[elem[3]].p) / 2.0f;
+			}
+			f /= cant_elem;
+			r /= cant_elem;
+			
+			ni.p = (4.0f * r - f + (cant_elem - 3.0f) * p) / cant_elem;
+		} else {
+			// Nodo de frontera: (r + p) / 2
+			// Donde r es el promedio de los dos puntos medios de las aristas de frontera
+			glm::vec3 r(0.0f);
+			int cont_frontera = 0;
+			
+			for (int ie : ni.e) {
+				const Elemento &elem = mesh.e[ie];
+				// La arista entre elem[1] (pto medio) y elem[2] (nodo original) es la arista 1 del quad
+				if (elem.v[1] == -1) {
+					r += mesh.n[elem[1]].p;
+					cont_frontera++;
+				}
+				// La arista entre elem[2] (nodo original) y elem[3] (pto medio) es la arista 2 del quad
+				if (elem.v[2] == -1) {
+					r += mesh.n[elem[3]].p;
+					cont_frontera++;
+				}
+			}
+			if (cont_frontera > 0) {
+				r /= static_cast<float>(cont_frontera);
+				ni.p = (r + p) / 2.0f;
+			}
+		}
+	}
+	
+	// Esta llamada valida si la estructura de datos quedó consistente
+	mesh.verificarIntegridad();
+}
+
+
+
+
+//void subdivide(SubDivMesh &mesh) {
+	
 	/// @@@@@: Implementar Catmull-Clark... lineamientos:
 	//  Los nodos originales estan en las posiciones 0 a #n-1 de m.n,
 	//  Los elementos orignales estan en las posiciones 0 a #e-1 de m.e
@@ -190,5 +331,5 @@ void subdivide(SubDivMesh &mesh) {
 	// índices están dentro del rango válido, y si son correctas las relaciones
 	// entre los .n de los elementos y los .e de los nodos). Mantener al final de
 	// esta función para ver que la subdivisión implementada no rompa esos invariantes.
-	mesh.verificarIntegridad();
-}
+//	mesh.verificarIntegridad();
+//}
